@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "test": "node --conditions=react-server --import tsx --test test/*.test.ts",
+    "sim:chat": "tsx scripts/simulate-dialogues.ts",
     "ai:setup": "bash scripts/setup-local-ai.sh",
     "db:seed": "tsx scripts/seed.ts",
     "db:backup": "tsx scripts/backup.ts",

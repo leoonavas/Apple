@@ -57,6 +57,7 @@ Nunca copie nem compartilhe `.data/certs/lan-ca-key.pem`. O certificado serve ap
 - Banco: `.data/apple.sqlite`; anexos: `.data/attachments/`.
 - Backup local do banco e dos anexos: `npm run db:backup`. Guarde a pasta `backup-*` em um local seguro.
 - `npm test` executa os testes de regras financeiras e recorrências.
+- `npm run sim:chat` gera e avalia 112 mil mensagens distintas em 14 cenários de linguagem brasileira. O resumo fica em `.data/simulations/latest.json` e os diálogos com resultados em `latest.jsonl.gz`. O gerador usa semente fixa e não altera o banco financeiro. A taxa mede apenas os cenários gerados; exemplos independentes e testes com SQLite complementam a avaliação.
 - O desenvolvimento local não acessa contas bancárias nem envia documentos a serviços externos.
 
 ## Publicação futura

@@ -1,7 +1,7 @@
 import "server-only";
 import { AssistantIntent, type AssistantIntent as ParsedIntent } from "./schema";
 import { callTextModel, callVisionModel, extractAttachmentText, transcribeAudio } from "./local-tools";
-import { fallbackIntent } from "./fallback";
+import { fallbackIntent, hasMultipleFinancialAmounts, requiresSafeClarification } from "./fallback";
 import { addMessage, adjustWalletBalance, createRecurrence, createTransaction, createWallet, getCategories, getRecentContext, listWallets, report, resolveCategoryIds, setWalletBalance, sourceAttachments, transferWalletFunds, updateAttachmentText, updateWallet, type WalletKind, type WalletView } from "@/lib/finance/service";
 import { localDate } from "@/lib/finance/dates";
 import { MAX_TRANSACTION_AMOUNT_CENTS, moneyMarkdown, normalizeMerchant, parseMoney, parseNonNegativeMoney, parseTransactionAmount } from "@/lib/finance/money";
@@ -42,7 +42,8 @@ export async function processUserMessage(messageId: string): Promise<{ replyId: 
   const rules = fallbackIntent(allText, categories, wallets);
   let parsed: ParsedIntent = rules;
   let usedLocalModel = false;
-  if (rules.intent !== "wallet") {
+  const useRules = canUseRuleResult(rules, allText, files);
+  if (!useRules) {
     try {
       const walletContext = wallets.map((wallet) => `${wallet.name} (${wallet.kind}): ${moneyMarkdown(wallet.balanceCents)}`);
       const output = imagePaths.length
@@ -72,6 +73,8 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
 
   if (parsed.intent === "transaction") {
     if (!parsed.transactions.length) return clarification(parsed.clarification ?? "Não encontrei um lançamento no pedido.");
+    const target = transactionWallet(context.allText);
+    if (target.question) return clarification(target.question);
     const saved: Array<{ id: string; amount: number; direction: string; description: string; merchant: string | null; categories: string[] }> = [];
     let needsClarification = false;
     let amountOutOfRange = false;
@@ -90,6 +93,7 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
         occurredOn: validDate(candidate.occurredOn) ?? localDate(),
         sourceMessageId: context.messageId,
         categoryIds,
+        walletId: target.wallet?.id,
       });
       const categoryNames = categoryIds.map((categoryId) => getCategories().find((category) => category.id === categoryId)?.name).filter(Boolean);
       saved.push({ id, amount: amountCents, direction: candidate.direction, description: candidate.description ?? "Movimentação", merchant, categories: categoryNames as string[] });
@@ -132,6 +136,39 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
   if (parsed.intent === "advice") return { content: buildAdvice(parsed.adviceTopic ?? "general"), chart: null };
   if (parsed.intent === "clarification") return clarification(parsed.clarification ?? "Pode dar mais detalhes para eu registrar isso corretamente?");
   return { content: "Posso registrar entradas e saídas, criar valores recorrentes, consultar gastos ou sugerir ajustes de orçamento. O que você gostaria de fazer?", chart: null };
+}
+
+function canUseRuleResult(intent: ParsedIntent, text: string, files: ReturnType<typeof sourceAttachments>): boolean {
+  if (intent.intent === "wallet" || hasMultipleFinancialAmounts(text) || requiresSafeClarification(text)) return true;
+  if (files.some((file) => !file.mimeType.startsWith("audio/"))) return false;
+  const normalized = normalizeMerchant(text);
+  if (/\b(?:amanha|corrigindo|entre|desde|ate)\b/.test(normalized) || /\b\d{1,2}[\/-]\d{1,2}\b/.test(text)) return false;
+  if (intent.intent === "transaction") return intent.transactions.length === 1 && !!intent.transactions[0]?.direction && !!intent.transactions[0]?.amount && intent.transactions[0].confidence >= 0.7;
+  if (intent.intent === "recurrence") return !!intent.recurrence?.direction && !!intent.recurrence.amount && !!intent.recurrence.frequency;
+  return intent.intent === "report" || intent.intent === "advice";
+}
+
+function transactionWallet(text: string): { wallet: WalletView | null; question: string | null } {
+  const normalized = normalizeMerchant(text);
+  const wallets = listWallets();
+  const explicit = wallets.filter((wallet) => {
+    const name = normalizeMerchant(wallet.name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`\\b(?:na|no|da|do|de|em|para|pra|pela|pelo)\\s+(?:(?:minha|meu)\\s+)?(?:carteira\\s+)?${name}\\b`).test(normalized);
+  }).sort((a, b) => b.name.length - a.name.length);
+  if (explicit.length) return { wallet: explicit[0], question: null };
+  const kind = /\b(?:na|no|da|do|de|em|para|pra)\s+(?:(?:minha|meu)\s+)?(?:carteira\s+de\s+)?(?:poupanca|caixinha|cofrinho)\b/.test(normalized) ? "savings"
+    : /\b(?:na|no|da|do|de|em|para|pra)\s+(?:(?:minha|meu)\s+)?(?:carteira\s+de\s+)?investimentos?\b/.test(normalized) ? "investment"
+      : /\b(?:na|no|da|do|de|em|para|pra)\s+(?:(?:minha|meu)\s+)?conta corrente\b/.test(normalized) ? "checking" : null;
+  if (kind) {
+    const reference = resolveWalletReference(wallets, null, kind);
+    if (reference.ambiguous) return { wallet: null, question: `qual carteira de ${walletKindLabel(kind)} deve receber essa movimentação?` };
+    if (!reference.wallet) return { wallet: null, question: `não encontrei uma carteira de ${walletKindLabel(kind)}. Crie-a primeiro pelo chat.` };
+    return { wallet: reference.wallet, question: null };
+  }
+  if (/\b(?:na|no|da|do|de|em|para|pra)\s+(?:(?:minha|meu)\s+)?carteira\s+[a-z]/.test(normalized)) {
+    return { wallet: null, question: "qual carteira existente deve receber essa movimentação?" };
+  }
+  return { wallet: null, question: null };
 }
 
 function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null): { content: string; chart: null } {
