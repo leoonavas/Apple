@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { clearSessionCookie, requestHasValidSession, validOrigin } from "@/lib/auth";
+import { createClient } from "@/lib/supabase/server";
+import { validOrigin } from "@/lib/auth";
 
 export async function POST(request: NextRequest) {
-  if (!validOrigin(request) || !requestHasValidSession(request)) return NextResponse.json({ error: "Não autorizado." }, { status: 403 });
-  await clearSessionCookie();
+  if (!validOrigin(request)) return NextResponse.json({ error: "Origem inválida." }, { status: 403 });
+  const supabase = await createClient();
+  await supabase.auth.signOut();
   return NextResponse.json({ ok: true });
 }

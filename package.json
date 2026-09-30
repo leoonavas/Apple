@@ -5,16 +5,22 @@
   "scripts": {
     "dev": "next dev",
     "dev:lan": "bash scripts/dev-lan.sh",
+    "worker:local": "node --env-file=.worker.env --import tsx scripts/local-worker.ts",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 8080 -H 0.0.0.0",
     "test": "node --conditions=react-server --import tsx --test test/*.test.ts",
     "sim:chat": "tsx scripts/simulate-dialogues.ts",
     "ai:setup": "bash scripts/setup-local-ai.sh",
     "db:seed": "tsx scripts/seed.ts",
     "db:backup": "tsx scripts/backup.ts",
+    "db:backup-supabase": "node --env-file=.backup.env --import tsx scripts/backup-supabase.ts",
+    "db:restore-supabase": "node --env-file=.backup.env --import tsx scripts/restore-supabase.ts",
+    "db:migrate-supabase": "node --env-file=.env.local --import tsx scripts/migrate-local-data.ts",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@supabase/ssr": "0.12.7",
+    "@supabase/supabase-js": "2.117.2",
     "better-sqlite3": "^12.4.1",
     "drizzle-orm": "^0.45.3",
     "lucide-react": "^1.48.0",
@@ -26,6 +32,7 @@
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
     "server-only": "^0.0.1",
+    "typescript": "5.9.3",
     "zod": "^4.1.12"
   },
   "devDependencies": {
@@ -34,7 +41,6 @@
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "drizzle-kit": "^0.31.11",
-    "tsx": "^4.23.15",
-    "typescript": "^5.9.3"
+    "tsx": "^4.23.15"
   }
 }

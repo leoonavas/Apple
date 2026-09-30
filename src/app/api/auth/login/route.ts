@@ -1,22 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { isConfigured, passwordMatches, setSessionCookie, validOrigin } from "@/lib/auth";
-
-export const runtime = "nodejs";
-const attempts = new Map<string, { count: number; since: number }>();
+import { z } from "zod";
+import { createClient } from "@/lib/supabase/server";
+import { validOrigin } from "@/lib/auth";
 
 export async function POST(request: NextRequest) {
   if (!validOrigin(request)) return NextResponse.json({ error: "Origem inválida." }, { status: 403 });
-  if (!isConfigured()) return NextResponse.json({ error: "Defina APP_ACCESS_PASSWORD com pelo menos 12 caracteres em .env.local e reinicie o app." }, { status: 503 });
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
-  const now = Date.now();
-  const attempt = attempts.get(ip);
-  if (attempt && now - attempt.since < 10 * 60_000 && attempt.count >= 10) return NextResponse.json({ error: "Muitas tentativas. Aguarde alguns minutos." }, { status: 429 });
-  const body = await request.json().catch(() => null) as { password?: string } | null;
-  if (!body?.password || !passwordMatches(body.password)) {
-    attempts.set(ip, attempt && now - attempt.since < 10 * 60_000 ? { count: attempt.count + 1, since: attempt.since } : { count: 1, since: now });
-    return NextResponse.json({ error: "Senha incorreta." }, { status: 401 });
-  }
-  attempts.delete(ip);
-  await setSessionCookie(request);
+  const body = z.object({ email: z.string().trim().email().max(254), password: z.string().min(1).max(128) }).safeParse(await request.json().catch(() => null));
+  if (!body.success) return NextResponse.json({ error: "Informe um e-mail e uma senha válidos." }, { status: 400 });
+  const supabase = await createClient();
+  const { error } = await supabase.auth.signInWithPassword(body.data);
+  if (error) return NextResponse.json({ error: "E-mail ou senha incorretos. Se acabou de criar a conta, confirme seu e-mail." }, { status: 401 });
   return NextResponse.json({ ok: true });
 }

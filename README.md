@@ -1,65 +1,110 @@
 # Apple Finanças
 
-MVP web local de finanças em formato de chat. A aplicação guarda mensagens, movimentações e comprovantes no próprio computador. Carteiras de conta corrente, poupança e investimentos mantêm saldos separados; transferências entre elas não alteram os relatórios de renda e gastos. O modelo local interpreta pedidos; os totais dos relatórios são calculados pelo SQLite.
+App de finanças pessoais em formato de chat, preparado para múltiplas contas com Supabase Auth, Postgres e Storage privados. A publicação planejada é `https://app.arcadya.cc`, com a aplicação na Discloud e OCR, transcrição e IA executados por um worker no computador local conectado.
 
-## Requisitos
+## Ambiente
 
-- macOS com Node.js 24 ou mais recente e npm.
-- Para usar no celular: ambos os aparelhos na mesma rede Wi-Fi. O HTTPS de desenvolvimento usa certificados locais gerados por OpenSSL, sem Homebrew.
-- Para transcrever áudio: o instalador local compila `whisper.cpp` e baixa o modelo multilíngue quantizado `medium-q5_0` (cerca de 515 MB), com melhor reconhecimento em português. Reserve aproximadamente 1 GB livre para compilação e modelo.
-- Para interpretação flexível dos pedidos: Ollama com `gemma3:4b` (cerca de 3,3 GB). O modelo é opcional; regras locais tratam registros comuns e relatórios mesmo sem ele.
+- Node.js 24 ou mais recente.
+- Projeto Supabase com a migration deste repositório aplicada.
+- Resend com `arcadya.cc` verificado para e-mails de confirmação e recuperação.
+- Discloud com subdomínio reservado e variáveis de produção cadastradas pelo painel.
+- Para processar mensagens: computador local ligado, Ollama com `gemma3:4b`, `whisper-cli` e modelo Whisper, FFmpeg, Tesseract e Poppler (`pdftotext` e `pdftoppm`).
 
-## Início rápido
+## Configurar o Supabase
+
+Copie `.env.example` para `.env.local` e preencha `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SERVICE_ROLE_KEY` e `WORKER_TOKEN`. Gere o token do worker com 32 bytes aleatórios. A chave `service_role` fica apenas no servidor e nos scripts administrativos de backup/migração; nunca a copie para `.worker.env` ou para o navegador.
+
+Na organização Supabase, crie o projeto em São Paulo (`sa-east-1`) e aplique `supabase/migrations/20260930113454_finance_multitenant_auth.sql`:
+
+```sh
+npx supabase login
+npx supabase link --project-ref SEU_PROJECT_REF
+npx supabase db push
+```
+
+Configure no painel Supabase **Authentication → URL Configuration**:
+
+- Site URL: `https://app.arcadya.cc`
+- Redirect URLs: `https://app.arcadya.cc/**`, `http://localhost:3000/**` e `http://127.0.0.1:3000/**`
+
+Em **Authentication → SMTP Settings**, use o SMTP da Resend (`smtp.resend.com`, porta 465, usuário `resend`, senha igual à chave `RESEND_API_KEY`) e o remetente `no-reply@arcadya.cc`. Verifique o domínio e seus registros DNS na Resend antes de testar cadastro ou recuperação. O bloco SMTP em `supabase/config.toml` serve ao ambiente local; o SMTP do projeto hospedado também precisa ser configurado no painel.
+
+Cada novo cadastro confirmado recebe categorias padrão e uma carteira principal pelo trigger da migration. O login usa e-mail e senha; confirmação de e-mail, recuperação e troca de senha passam pelo Supabase Auth.
+
+## Executar o site
 
 ```sh
 npm install
-cp .env.example .env.local
-```
-
-Edite `.env.local` e defina `APP_ACCESS_PASSWORD` com uma senha privada de pelo menos 12 caracteres. Para gerar uma senha aleatória, execute `openssl rand -base64 32` e copie o resultado para esse arquivo. Não compartilhe o arquivo; ele está ignorado pelo Git.
-
-Inicie o app no computador:
-
-```sh
 npm run dev
 ```
 
-Abra `http://localhost:3000`, entre com a senha e comece pelo chat. Sem Ollama, frases simples como “Gastei R$ 50 no mercado” e relatórios básicos usam um interpretador local por regras. No macOS, OCR de imagens e PDFs digitalizados usa Vision e PDFKit do próprio sistema.
+Abra `http://localhost:3000`. Crie a primeira conta pela tela de cadastro e confirme o link recebido por e-mail. O build de produção pode ser verificado com `npm run build`; a aplicação inicia na porta 8080 com `npm start`.
 
-## Ferramentas locais de IA
+## Worker local de IA
+
+O worker recebe tarefas autenticadas, baixa anexos por URLs assinadas de curta duração, processa tudo em arquivos temporários e envia ao servidor somente o texto extraído e a interpretação. Ele não precisa de URL do banco nem da chave `service_role`.
+
+1. Copie `.worker.env.example` para `.worker.env` no computador que executará a IA.
+2. Coloque nele o mesmo `WORKER_TOKEN` cadastrado no servidor e defina `WORKER_URL` como a URL pública do app.
+3. Instale nesse computador as ferramentas locais de OCR, áudio e IA listadas acima. Defina `WHISPER_MODEL` para o caminho do modelo Whisper.
+4. Inicie o worker:
 
 ```sh
-npm run ai:setup
+npm install
+npm run worker:local
 ```
 
-O instalador compila Whisper e prepara o OCR do macOS dentro de `.data/`, sem permissões administrativas nem alterações no Homebrew. Baixe o aplicativo oficial do [Ollama para macOS](https://ollama.com/download), mova `Ollama.app` para `~/Applications` e abra o aplicativo. Depois, baixe o modelo de interpretação:
+O worker consulta a fila a cada três segundos e remove os arquivos temporários após cada tarefa. Em Windows, configure a inicialização do worker pelo Agendador de Tarefas para mantê-lo ativo depois do login. O setup `npm run ai:setup` prepara as ferramentas do macOS; em Windows, instale os executáveis compatíveis e deixe-os disponíveis no `PATH`.
+
+Se o worker estiver desligado, a mensagem fica aguardando processamento. O app não envia anexos ou texto financeiro a uma API externa de IA.
+
+## Migração dos dados SQLite existentes
+
+Mantenha uma cópia do banco local antes de migrar:
 
 ```sh
-ollama pull gemma3:4b
+npm run db:backup
 ```
 
-Ao iniciar o Ollama, ele mantém a API local disponível em `127.0.0.1:11434`. Gemma recebe instruções delimitadas para interpretar registros, recorrências, filtros de relatório e pedidos de orientação. Ele retorna JSON validado pelo servidor; saldos e relatórios são calculados pelo SQLite. Áudio gravado no app é convertido no próprio navegador para WAV mono de 16 kHz e transcrito com Whisper. PDFs pesquisáveis usam extração de texto local; PDFs digitalizados e imagens passam pelo Vision e, quando disponível, pelo modelo visual. Mensagens, anexos e inferência ficam no computador por padrão.
+Crie e confirme uma conta no novo app. Em `.env.local`, defina `MIGRATION_EMAIL` com o e-mail dessa conta. Depois rode:
 
-Formatos aceitos: PDF, JPEG, PNG, WebP, HEIC, WebM, OGG, MP4/M4A, MP3 e WAV. Máximo de quatro arquivos por mensagem, 20 MB por arquivo e 30 MB combinados. O processamento de PDF digitalizado cobre as cinco primeiras páginas; PDFs com texto pesquisável podem ser extraídos por inteiro.
+```sh
+npm run db:migrate-supabase
+```
 
-## Acesso pelo celular na rede local
+O script associa categorias e a carteira principal existentes, envia os anexos ao bucket privado e copia mensagens, movimentações, transferências, ajustes, regras e recorrências. Ele não apaga o SQLite local; se a migração for interrompida, pode ser executado novamente.
 
-Áudio no navegador exige HTTPS quando a página é acessada pelo IP do computador. `dev:lan` cria certificados de desenvolvimento locais, sem instalar ferramentas no sistema.
+## Backup e restauração criptografados
 
-1. Execute `npm run dev:lan` no computador.
-2. Compartilhe por AirDrop somente o certificado público `.data/certs/lan-ca.crt` com o celular. No iPhone, instale o perfil e habilite confiança total em **Ajustes › Geral › Sobre › Ajustes de Confiança de Certificados**. No Android, instale a CA nas credenciais do usuário; os nomes das telas variam por fabricante.
-3. Abra o endereço HTTPS que o terminal mostrar e entre com a senha local.
+O plano Supabase Free não inclui backups automáticos baixáveis. O backup deste app é criado no computador confiável e criptografado com AES-256-GCM.
 
-Nunca copie nem compartilhe `.data/certs/lan-ca-key.pem`. O certificado serve apenas para desenvolvimento local. O servidor fica disponível na rede enquanto `dev:lan` estiver executando; mantenha a senha privada.
+1. Copie `.backup.env.example` para `.backup.env`.
+2. Configure URL, chave `service_role` e uma senha aleatória forte. Guarde a senha fora do computador; sem ela, não há restauração.
+3. Crie o arquivo criptografado:
 
-## Dados e backup
+```sh
+npm run db:backup-supabase
+```
 
-- Banco: `.data/apple.sqlite`; anexos: `.data/attachments/`.
-- Backup local do banco e dos anexos: `npm run db:backup`. Guarde a pasta `backup-*` em um local seguro.
-- `npm test` executa os testes de regras financeiras e recorrências.
-- `npm run sim:chat` gera e avalia 112 mil mensagens distintas em 14 cenários de linguagem brasileira. O resumo fica em `.data/simulations/latest.json` e os diálogos com resultados em `latest.jsonl.gz`. O gerador usa semente fixa e não altera o banco financeiro. A taxa mede apenas os cenários gerados; exemplos independentes e testes com SQLite complementam a avaliação.
-- O desenvolvimento local não acessa contas bancárias nem envia documentos a serviços externos.
+Para restaurar em um projeto com a mesma migration aplicada, use o arquivo `.jsonl.enc` produzido em `.data/backups`:
 
-## Publicação futura
+```sh
+RESTORE_CONFIRM=RESTORE npm run db:restore-supabase -- .data/backups/ARQUIVO.jsonl.enc
+```
 
-O deploy na Vercel é uma etapa posterior à aprovação deste MVP. Antes dele, migrar o repositório SQLite para banco PostgreSQL hospedado, os arquivos locais para armazenamento persistente, a inferência Ollama/Whisper para serviços hospedados e adicionar autenticação adequada a usuários públicos. A Vercel não garante persistência de arquivos SQLite nas funções serverless.
+A restauração é aditiva e exige a senha correta. Contas recriadas recebem senhas temporárias aleatórias; cada pessoa deve usar **Esqueci minha senha** para definir uma nova. Guarde apenas a cópia local criptografada conforme a decisão do beta; perdê-la pode impedir a recuperação. `.backup.env`, `.worker.env` e os arquivos de backup não devem ser enviados à hospedagem nem ao Git.
+
+## Publicação na Discloud e domínio
+
+O `discloud.config` prepara o build de Next.js na porta 8080, com 1 GB de RAM e reinício automático. Cadastre no painel da Discloud as variáveis públicas do Supabase e as chaves secretas de servidor; não inclua arquivos `.env` no pacote. Reserve primeiro o subdomínio configurado como `ID=arcadya-finances` e publique a aplicação nesse endereço.
+
+Depois, no painel Discloud → **Domains**, associe `app.arcadya.cc`, siga os registros TXT de verificação e A exibidos para o seu domínio e faça rebuild do app após a validação. O domínio customizado depende do plano Diamond ou superior. O painel da Discloud é a fonte dos valores TXT/A e pode mostrá-los por aplicação.
+
+## Contas e privacidade
+
+- Cada conta só consulta dados próprios, protegidos por RLS no banco e bucket privado no Storage.
+- Limites beta: até 25 contas, 30 MB armazenados por conta, 100 MB processados por conta/mês, 20 MB por arquivo e até quatro anexos por mensagem.
+- **Conta e dados** permite baixar um JSON com registros e anexos ou excluir a conta.
+- [Aviso de privacidade](/privacy) e [termos do beta](/terms) descrevem armazenamento e processamento. Configure `NEXT_PUBLIC_PRIVACY_EMAIL` e complete a identificação legal de quem opera o serviço antes da abertura pública.
+
+O Supabase Free custa US$ 0/mês, mas pode pausar projetos após uma semana com pouca atividade e não oferece backup automático baixável. O orçamento e os limites de armazenamento devem ser revistos antes de passar do beta.

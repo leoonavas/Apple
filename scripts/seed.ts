@@ -1,4 +1,5 @@
 import "../src/lib/db";
-import { getCategories } from "../src/lib/finance/service";
+import { rawDb } from "../src/lib/db";
 
-console.log(`SQLite inicializado com ${getCategories().length} categorias padrão.`);
+const count = (rawDb.prepare("SELECT COUNT(*) AS count FROM categories").get() as { count: number }).count;
+console.log(`Banco SQLite legado inicializado com ${count} categorias padrão.`);

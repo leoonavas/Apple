@@ -1,0 +1,16 @@
+node_modules/
+.next/
+.data/
+.git/
+.env*
+.worker.env*
+.backup.env*
+.backup.env*
+.vercel/
+coverage/
+test/
+models/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.tsbuildinfo

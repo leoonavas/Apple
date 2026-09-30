@@ -15,6 +15,7 @@ const INITIAL_WAVEFORM_LEVELS = WAVEFORM_BARS.map((index) => 0.1 + Math.abs(Math
 
 export function ChatScreen() {
   const [messages, setMessages] = useState<MessageView[]>([]);
+  const [pendingJobIds, setPendingJobIds] = useState<string[]>([]);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
@@ -45,9 +46,36 @@ export function ChatScreen() {
     if (response.status === 401) { router.replace("/login"); return; }
     const body = await response.json();
     setMessages(body.messages ?? []);
+    const jobsResponse = await fetch("/api/jobs", { cache: "no-store" });
+    if (jobsResponse.ok) {
+      const jobsBody = await jobsResponse.json();
+      setPendingJobIds((jobsBody.jobs ?? []).map((job: { id: string }) => job.id));
+    }
   }, [router]);
 
   useEffect(() => { void loadMessages(); }, [loadMessages]);
+  useEffect(() => {
+    if (!pendingJobIds.length) return;
+    let active = true;
+    const poll = async () => {
+      const results = await Promise.all(pendingJobIds.map(async (id) => {
+        try {
+          const response = await fetch(`/api/jobs/${id}`, { cache: "no-store" });
+          if (!response.ok) return { id, status: "unknown" };
+          return { id, ...(await response.json()) as { status: string; error?: string | null } };
+        } catch { return { id, status: "unknown" }; }
+      }));
+      if (!active) return;
+      const finished = results.filter((job) => job.status === "done" || job.status === "failed");
+      if (!finished.length) return;
+      setPendingJobIds((current) => current.filter((id) => !finished.some((job) => job.id === id)));
+      if (finished.some((job) => job.status === "failed")) setError("Uma mensagem não pôde ser processada. Tente novamente quando o processador local estiver conectado.");
+      await loadMessages();
+    };
+    const interval = window.setInterval(() => { void poll(); }, 2500);
+    void poll();
+    return () => { active = false; window.clearInterval(interval); };
+  }, [pendingJobIds, loadMessages]);
   useEffect(() => { latestComposerRef.current = { text, files }; }, [text, files]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [messages, busy, files.length, recording]);
 
@@ -143,8 +171,9 @@ export function ChatScreen() {
     try {
       const response = await fetch("/api/messages", { method: "POST", body: payload });
       const body = await response.json();
-      if (!response.ok) throw new Error(body.error ?? "Não consegui processar a mensagem.");
-      setMessages(body.messages ?? []);
+      if (!response.ok) throw new Error(body.error ?? "Não consegui enviar a mensagem.");
+      setPendingJobIds((current) => [...new Set([...current, body.jobId])]);
+      await loadMessages();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Falha ao enviar.");
       await loadMessages();
@@ -260,7 +289,7 @@ export function ChatScreen() {
         <div className="welcome-orb">✳</div>
         <p className="eyebrow">SUAS FINANÇAS, EM CONVERSA</p>
         <h1>Bom dia.<br /><span>Vamos organizar?</span></h1>
-        <p className="welcome-copy">Registre um gasto, envie um comprovante ou peça um resumo. Seus dados ficam neste computador.</p>
+        <p className="welcome-copy">Registre um gasto, envie um comprovante ou peça um resumo. Seus dados ficam na sua conta privada; a IA trabalha no computador local conectado.</p>
         <div className="suggestion-list">{suggestions.map((suggestion) => <button key={suggestion} className="suggestion-chip" onClick={() => void submit(undefined, suggestion)}>{suggestion}</button>)}</div>
       </div>}
       <div className="message-list">
@@ -277,7 +306,7 @@ export function ChatScreen() {
             })}</div>}
           </div>
         </article>)}
-        {busy && <div className="thinking"><span className="assistant-dot">✳</span><span>Organizando suas finanças</span><LoaderCircle size={15} className="spin" /></div>}
+        {(busy || pendingJobIds.length > 0) && <div className="thinking"><span className="assistant-dot">✳</span><span>{busy ? "Enviando mensagem" : "Aguardando processamento local"}</span><LoaderCircle size={15} className="spin" /></div>}
         <div ref={endRef} />
       </div>
     </div>
@@ -315,7 +344,7 @@ export function ChatScreen() {
           </>}
         </div>
       </form>
-      <div className="composer-note">Seus anexos e mensagens são processados localmente.</div>
+      <div className="composer-note">Anexos privados. O processamento de IA acontece no computador local conectado.</div>
     </div>
   </section>;
 }

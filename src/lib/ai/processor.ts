@@ -1,71 +1,40 @@
 import "server-only";
-import { AssistantIntent, type AssistantIntent as ParsedIntent } from "./schema";
-import { callTextModel, callVisionModel, extractAttachmentText, transcribeAudio } from "./local-tools";
-import { fallbackIntent, hasMultipleFinancialAmounts, requiresSafeClarification } from "./fallback";
-import { addMessage, adjustWalletBalance, createRecurrence, createTransaction, createWallet, getCategories, getRecentContext, listWallets, report, resolveCategoryIds, setWalletBalance, sourceAttachments, transferWalletFunds, updateAttachmentText, updateWallet, type WalletKind, type WalletView } from "@/lib/finance/service";
+import type { AssistantIntent as ParsedIntent } from "./schema";
+import { addMessage, adjustWalletBalance, createRecurrence, createTransaction, createWallet, getCategories, getMessageForProcessing, listWallets, report, resolveCategoryIds, setWalletBalance, sourceAttachments, transferWalletFunds, updateAttachmentText, updateProcessingJob, updateWallet, type WalletKind, type WalletView } from "@/lib/finance/service";
+import { withPrivilegedUser } from "@/lib/supabase/data-context";
 import { localDate } from "@/lib/finance/dates";
 import { MAX_TRANSACTION_AMOUNT_CENTS, moneyMarkdown, normalizeMerchant, parseMoney, parseNonNegativeMoney, parseTransactionAmount } from "@/lib/finance/money";
 import type { ChartSpec } from "@/lib/finance/types";
-import { rawDb } from "@/lib/db";
 
 const currency = (cents: number) => moneyMarkdown(cents);
 const maxTransactionAmount = currency(MAX_TRANSACTION_AMOUNT_CENTS);
 
-export async function processUserMessage(messageId: string): Promise<{ replyId: string; content: string; chart: ChartSpec | null }> {
-  const row = rawDb.prepare("SELECT content FROM messages WHERE id = ? AND role='user'").get(messageId) as { content: string } | undefined;
-  if (!row) throw new Error("Mensagem não encontrada.");
-  const userText = row.content;
-  const files = sourceAttachments(messageId);
-  const extracted: string[] = [];
-  const errors: string[] = [];
-  const imagePaths: string[] = [];
-  for (const file of files) {
-    if (file.mimeType.startsWith("image/") && file.mimeType !== "image/heic") imagePaths.push(file.diskPath);
+export async function completeAnalyzedMessage(messageId: string, userId: string, analysis: {
+  parsed: ParsedIntent;
+  extractedTexts: Array<{ attachmentId: string; text: string }>;
+  errors: string[];
+  usedLocalModel: boolean;
+}) {
+  return withPrivilegedUser(userId, async () => {
     try {
-      if (file.mimeType.startsWith("audio/")) {
-        const transcript = await transcribeAudio(file.diskPath);
-        if (transcript) { extracted.push(transcript); updateAttachmentText(file.id, transcript); }
-      } else {
-        const text = await extractAttachmentText(file.diskPath, file.mimeType);
-        if (text) { extracted.push(text); updateAttachmentText(file.id, text); }
-      }
+      const userText = await getMessageForProcessing(messageId);
+      if (userText === undefined) throw new Error("Mensagem não encontrada.");
+      const files = await sourceAttachments(messageId);
+      const allowedIds = new Set(files.map((file) => file.id));
+      const extracted = analysis.extractedTexts.filter((entry) => allowedIds.has(entry.attachmentId));
+      for (const entry of extracted) await updateAttachmentText(entry.attachmentId, entry.text.slice(0, 100_000));
+      const allText = [userText, ...extracted.map((entry) => entry.text)].filter(Boolean).join("\n\n").trim();
+      const result = await executeIntent(analysis.parsed, { messageId, userText, allText });
+      if (analysis.errors.length) result.content += `\n\n> Alguns anexos não puderam ser processados localmente. ${analysis.errors.map((error) => error.split(":")[0]).join(", ")}. Confira a instalação das ferramentas de áudio/OCR no README.`;
+      if (!analysis.usedLocalModel && !analysis.errors.length && analysis.parsed.intent === "unsupported") result.content = "Ainda não consegui interpretar esse pedido. Você pode registrar entradas e saídas, criar ou consultar carteiras, guardar/transferir dinheiro entre elas, criar recorrências, pedir relatórios ou solicitar sugestões financeiras.";
+      const replyId = await addMessage("assistant", result.content, result.chart);
+      await updateProcessingJob(messageId, "done");
+      return { replyId, content: result.content, chart: result.chart };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "falha desconhecida";
-      errors.push(`${file.originalName}: ${message}`);
+      await updateProcessingJob(messageId, "failed", error instanceof Error ? error.message.slice(0, 500) : "Falha no processamento.").catch(() => undefined);
+      throw error;
     }
-  }
-
-  const allText = [userText, ...extracted].filter(Boolean).join("\n\n").trim();
-  const categories = getCategories().map((category) => category.name);
-  const wallets = listWallets();
-  const history = getRecentContext(messageId);
-  const rules = fallbackIntent(allText, categories, wallets);
-  let parsed: ParsedIntent = rules;
-  let usedLocalModel = false;
-  const useRules = canUseRuleResult(rules, allText, files);
-  if (!useRules) {
-    try {
-      const walletContext = wallets.map((wallet) => `${wallet.name} (${wallet.kind}): ${moneyMarkdown(wallet.balanceCents)}`);
-      const output = imagePaths.length
-        ? await callVisionModel(allText, imagePaths, categories, history, walletContext)
-        : await callTextModel(allText, categories, history, walletContext);
-      parsed = AssistantIntent.parse(JSON.parse(output));
-      usedLocalModel = true;
-    } catch {
-      parsed = rules;
-    }
-  }
-
-  const result = await executeIntent(parsed, { messageId, userText, allText });
-  if (errors.length) {
-    result.content += `\n\n> Alguns anexos não puderam ser processados localmente. ${errors.map((error) => error.split(":")[0]).join(", ")}. Confira a instalação das ferramentas de áudio/OCR no README.`;
-  }
-  if (!usedLocalModel && !errors.length && parsed.intent === "unsupported") {
-    result.content = "Ainda não consegui interpretar esse pedido. Você pode registrar entradas e saídas, criar ou consultar carteiras, guardar/transferir dinheiro entre elas, criar recorrências, pedir relatórios ou solicitar sugestões financeiras.";
-  }
-  const replyId = addMessage("assistant", result.content, result.chart);
-  rawDb.prepare("UPDATE processing_jobs SET status='done', updated_at=? WHERE user_message_id=?").run(Date.now(), messageId);
-  return { replyId, content: result.content, chart: result.chart };
+  });
 }
 
 async function executeIntent(parsed: ParsedIntent, context: { messageId: string; userText: string; allText: string }): Promise<{ content: string; chart: ChartSpec | null }> {
@@ -73,7 +42,7 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
 
   if (parsed.intent === "transaction") {
     if (!parsed.transactions.length) return clarification(parsed.clarification ?? "Não encontrei um lançamento no pedido.");
-    const target = transactionWallet(context.allText);
+    const target = await transactionWallet(context.allText);
     if (target.question) return clarification(target.question);
     const saved: Array<{ id: string; amount: number; direction: string; description: string; merchant: string | null; categories: string[] }> = [];
     let needsClarification = false;
@@ -84,8 +53,8 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
       if (rawAmountCents !== null && amountCents === null) amountOutOfRange = true;
       if (!amountCents || !candidate.direction || candidate.confidence < 0.55) { needsClarification = true; continue; }
       const merchant = explicitRecipient(context.userText) ?? candidate.merchant;
-      const categoryIds = resolveCategoryIds(candidate.categories, merchant, context.userText);
-      const id = createTransaction({
+      const categoryIds = await resolveCategoryIds(candidate.categories, merchant, context.userText);
+      const id = await createTransaction({
         direction: candidate.direction,
         amountCents,
         description: candidate.description?.trim() || (candidate.direction === "income" ? "Entrada" : "Saída"),
@@ -95,7 +64,8 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
         categoryIds,
         walletId: target.wallet?.id,
       });
-      const categoryNames = categoryIds.map((categoryId) => getCategories().find((category) => category.id === categoryId)?.name).filter(Boolean);
+      const categoryRows = await getCategories();
+      const categoryNames = categoryIds.map((categoryId) => categoryRows.find((category) => category.id === categoryId)?.name).filter(Boolean);
       saved.push({ id, amount: amountCents, direction: candidate.direction, description: candidate.description ?? "Movimentação", merchant, categories: categoryNames as string[] });
     }
     if (saved.length) {
@@ -115,15 +85,15 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
     if (rawAmountCents !== null && amountCents === null) return clarification(`O valor reconhecido ultrapassou o limite seguro de ${maxTransactionAmount}. Confirme o valor da recorrência.`);
     if (!amountCents || !item.direction || !item.frequency) return clarification(`Para criar a recorrência, informe um valor de até ${maxTransactionAmount}, se é entrada ou saída e se acontece toda semana, mês ou ano.`);
     const merchant = explicitRecipient(context.userText) ?? item.merchant;
-    const categoryIds = resolveCategoryIds(item.categories, merchant, context.userText);
+    const categoryIds = await resolveCategoryIds(item.categories, merchant, context.userText);
     const startOn = validDate(item.startOn) ?? localDate();
-    createRecurrence({ name: item.name ?? (item.direction === "income" ? "Entrada recorrente" : "Gasto recorrente"), direction: item.direction, amountCents, merchant, description: item.description ?? item.name ?? "Movimentação recorrente", frequency: item.frequency, startOn, endOn: validDate(item.endOn), categoryIds });
+    await createRecurrence({ name: item.name ?? (item.direction === "income" ? "Entrada recorrente" : "Gasto recorrente"), direction: item.direction, amountCents, merchant, description: item.description ?? item.name ?? "Movimentação recorrente", frequency: item.frequency, startOn, endOn: validDate(item.endOn), categoryIds });
     return { content: `Criei a recorrência **${escapeMd(item.name ?? "Movimentação recorrente")}** de ${currency(amountCents)}, com frequência ${item.frequency === "monthly" ? "mensal" : item.frequency === "weekly" ? "semanal" : "anual"}. A primeira ocorrência foi registrada se a data já chegou.`, chart: null };
   }
 
   if (parsed.intent === "report") {
     const filters = parsed.report;
-    const reportResult = report({ period: filters?.period ?? "all", start: filters?.start, end: filters?.end, categoryNames: filters?.categories ?? [], groupBy: filters?.groupBy });
+    const reportResult = await report({ period: filters?.period ?? "all", start: filters?.start, end: filters?.end, categoryNames: filters?.categories ?? [], groupBy: filters?.groupBy });
     const categoryLine = filters?.categories?.length ? `\n**Filtro:** ${filters.categories.map(escapeMd).join(", ")}` : "";
     if (!reportResult.count) return { content: `Não encontrei movimentações em **${reportResult.periodLabel}**.${categoryLine}\n\nQuando você registrar entradas ou saídas, elas aparecerão aqui.`, chart: reportResult.chart };
     const rows = filters?.categories?.length ? reportResult.merchantRows : reportResult.categoryRows;
@@ -133,24 +103,14 @@ async function executeIntent(parsed: ParsedIntent, context: { messageId: string;
     return { content: `## Relatório — ${reportResult.periodLabel}${categoryLine}\n\n- **Entradas:** ${currency(reportResult.incomeCents)}\n- **Saídas:** ${currency(reportResult.expenseCents)}\n- **Resultado do período:** ${currency(reportResult.netCents)}\n- **Movimentações:** ${reportResult.count}${categorySummary}${overlap}`, chart: reportResult.chart };
   }
 
-  if (parsed.intent === "advice") return { content: buildAdvice(parsed.adviceTopic ?? "general"), chart: null };
+  if (parsed.intent === "advice") return { content: await buildAdvice(parsed.adviceTopic ?? "general"), chart: null };
   if (parsed.intent === "clarification") return clarification(parsed.clarification ?? "Pode dar mais detalhes para eu registrar isso corretamente?");
   return { content: "Posso registrar entradas e saídas, criar valores recorrentes, consultar gastos ou sugerir ajustes de orçamento. O que você gostaria de fazer?", chart: null };
 }
 
-function canUseRuleResult(intent: ParsedIntent, text: string, files: ReturnType<typeof sourceAttachments>): boolean {
-  if (intent.intent === "wallet" || hasMultipleFinancialAmounts(text) || requiresSafeClarification(text)) return true;
-  if (files.some((file) => !file.mimeType.startsWith("audio/"))) return false;
+async function transactionWallet(text: string): Promise<{ wallet: WalletView | null; question: string | null }> {
   const normalized = normalizeMerchant(text);
-  if (/\b(?:amanha|corrigindo|entre|desde|ate)\b/.test(normalized) || /\b\d{1,2}[\/-]\d{1,2}\b/.test(text)) return false;
-  if (intent.intent === "transaction") return intent.transactions.length === 1 && !!intent.transactions[0]?.direction && !!intent.transactions[0]?.amount && intent.transactions[0].confidence >= 0.7;
-  if (intent.intent === "recurrence") return !!intent.recurrence?.direction && !!intent.recurrence.amount && !!intent.recurrence.frequency;
-  return intent.intent === "report" || intent.intent === "advice";
-}
-
-function transactionWallet(text: string): { wallet: WalletView | null; question: string | null } {
-  const normalized = normalizeMerchant(text);
-  const wallets = listWallets();
+  const wallets = await listWallets();
   const explicit = wallets.filter((wallet) => {
     const name = normalizeMerchant(wallet.name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`\\b(?:na|no|da|do|de|em|para|pra|pela|pelo)\\s+(?:(?:minha|meu)\\s+)?(?:carteira\\s+)?${name}\\b`).test(normalized);
@@ -171,9 +131,9 @@ function transactionWallet(text: string): { wallet: WalletView | null; question:
   return { wallet: null, question: null };
 }
 
-function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null): { content: string; chart: null } {
+async function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null): Promise<{ content: string; chart: null }> {
   if (!action) return walletClarification("o que você quer fazer com a carteira?");
-  const wallets = listWallets();
+  const wallets = await listWallets();
   const reference = resolveWalletReference(wallets, action.walletName, action.walletKind);
 
   if (action.action === "balance") {
@@ -195,7 +155,7 @@ function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null)
     if (duplicate) return { content: `A carteira **${escapeMd(duplicate.name)}** já existe e está com saldo de **${currency(duplicate.balanceCents)}**.`, chart: null };
     const openingBalanceCents = action.amount ? parseNonNegativeMoney(action.amount) : 0;
     if (openingBalanceCents === null) return walletClarification("qual é o saldo inicial válido dessa carteira?");
-    createWallet({ name, kind, openingBalanceCents });
+    await createWallet({ name, kind, openingBalanceCents });
     return { content: `Criei a carteira **${escapeMd(name)}** em **${walletKindLabel(kind)}** com saldo inicial de **${currency(openingBalanceCents)}**.`, chart: null };
   }
 
@@ -207,7 +167,7 @@ function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null)
     if (wallets.some((wallet) => wallet.id !== reference.wallet!.id && normalizeMerchant(wallet.name) === normalizeMerchant(newName))) {
       return walletClarification(`já existe outra carteira chamada **${escapeMd(newName)}**. Escolha um nome diferente.`);
     }
-    updateWallet({ id: reference.wallet.id, name: newName, openingBalanceCents: reference.wallet.openingBalanceCents });
+    await updateWallet({ id: reference.wallet.id, name: newName, openingBalanceCents: reference.wallet.openingBalanceCents });
     return { content: `Renomeei a carteira para **${escapeMd(newName)}**. O saldo continua em **${currency(reference.wallet.balanceCents)}**.`, chart: null };
   }
 
@@ -225,14 +185,14 @@ function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null)
       createDestination = { name: action.walletName?.trim() || defaultWalletName(action.walletKind), kind: action.walletKind };
     }
     try {
-      const result = transferWalletFunds({
+      const result = await transferWalletFunds({
         fromWalletId: sourceReference.wallet.id,
         toWalletId: reference.wallet?.id ?? null,
         createDestination,
         amountCents,
         description: action.description?.trim() || "Transferência entre carteiras",
       });
-      const destination = listWallets().find((wallet) => wallet.id === result.toWalletId)!;
+      const destination = (await listWallets()).find((wallet) => wallet.id === result.toWalletId)!;
       return { content: `Transferi **${currency(amountCents)}** de **${escapeMd(sourceReference.wallet.name)}** para **${escapeMd(destination.name)}**.\n\nEssa movimentação altera os saldos das carteiras, mas não entra como renda ou gasto nos relatórios.`, chart: null };
     } catch (error) {
       return walletClarification(error instanceof Error ? error.message : "não consegui concluir a transferência.");
@@ -249,13 +209,13 @@ function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null)
       const duplicate = wallets.find((item) => normalizeMerchant(item.name) === normalizeMerchant(name));
       if (duplicate) wallet = duplicate;
       else {
-        createWallet({ name, kind: action.walletKind, openingBalanceCents: amountCents });
+        await createWallet({ name, kind: action.walletKind, openingBalanceCents: amountCents });
         return { content: `Criei **${escapeMd(name)}** com saldo de **${currency(amountCents)}**. Esse ajuste de carteira não aparece como renda nos relatórios.`, chart: null };
       }
     }
     if (!wallet) return walletClarification("qual carteira existente deve receber esse ajuste?");
     try {
-      adjustWalletBalance({ walletId: wallet.id, direction: action.action === "add_balance" ? "credit" : "debit", amountCents, description: action.description?.trim() || "Ajuste de saldo pelo chat" });
+      await adjustWalletBalance({ walletId: wallet.id, direction: action.action === "add_balance" ? "credit" : "debit", amountCents, description: action.description?.trim() || "Ajuste de saldo pelo chat" });
       return { content: action.action === "add_balance"
         ? `Adicionei **${currency(amountCents)}** ao saldo de **${escapeMd(wallet.name)}**. Esse ajuste não é contado como renda nos relatórios.`
         : `Retirei **${currency(amountCents)}** do saldo de **${escapeMd(wallet.name)}**. Esse ajuste não é contado como gasto nos relatórios.`, chart: null };
@@ -269,7 +229,7 @@ function executeWalletIntent(action: NonNullable<ParsedIntent["wallet"]> | null)
     if (amountCents === null) return walletClarification("qual deve ser o saldo atual da carteira?");
     if (reference.ambiguous) return walletClarification(`qual carteira de ${walletKindLabel(action.walletKind)} você quer ajustar?`);
     if (!reference.wallet) return walletClarification("qual carteira existente você quer ajustar?");
-    const delta = setWalletBalance({ walletId: reference.wallet.id, balanceCents: amountCents, description: action.description?.trim() || "Saldo ajustado pelo chat" });
+    const delta = await setWalletBalance({ walletId: reference.wallet.id, balanceCents: amountCents, description: action.description?.trim() || "Saldo ajustado pelo chat" });
     return { content: `Atualizei o saldo de **${escapeMd(reference.wallet.name)}** para **${currency(amountCents)}**${delta ? ". O ajuste foi registrado sem alterar renda ou gastos." : "; ele já estava nesse valor."}`, chart: null };
   }
 
@@ -304,8 +264,8 @@ function walletClarification(question: string) {
   return { content: `Para concluir a ação da carteira, preciso confirmar: ${question}`, chart: null };
 }
 
-function buildAdvice(topic: string): string {
-  const month = report({ period: "month", groupBy: "category" });
+async function buildAdvice(topic: string): Promise<string> {
+  const month = await report({ period: "month", groupBy: "category" });
   const total = month.incomeCents;
   if (topic === "investing") {
     return `## Orientação sobre investimentos\n\n1. Defina objetivo e prazo antes de comparar opções.\n2. Considere liquidez e riscos que aceita assumir.\n3. Monte uma reserva para imprevistos antes de comprometer valores de curto prazo.\n\nNão indico ativos ou produtos específicos. A adequação depende de objetivos, situação financeira e tolerância a risco. Consulte o material educacional da [CVM](https://www.gov.br/investidor/pt-br/investir/antes-de-investir/respeite-o-seu-perfil-de-investidor/entenda-o-suitability).`;

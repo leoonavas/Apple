@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { ChartNoAxesCombined, MessageCircle, ReceiptText, Settings2, LogOut, Menu, X, WalletCards } from "lucide-react";
+import { ChartNoAxesCombined, MessageCircle, ReceiptText, Settings2, LogOut, Menu, X, WalletCards, UserRound } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 const nav = [
@@ -92,6 +92,9 @@ export function AppShell({ children }: { children: ReactNode }) {
           </Link>)}
           <Link href="/recurrences" aria-current={pathname === "/recurrences" ? "page" : undefined} className={`drawer-link ${pathname === "/recurrences" ? "active" : ""}`} onClick={() => setMenuOpen(false)}>
             <Settings2 size={19} strokeWidth={pathname === "/recurrences" ? 2.2 : 1.8} /><span>Recorrências</span>
+          </Link>
+          <Link href="/account" aria-current={pathname === "/account" ? "page" : undefined} className={`drawer-link ${pathname === "/account" ? "active" : ""}`} onClick={() => setMenuOpen(false)}>
+            <UserRound size={19} strokeWidth={pathname === "/account" ? 2.2 : 1.8} /><span>Conta e dados</span>
           </Link>
         </nav>
         <div className="drawer-footer">

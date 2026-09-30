@@ -11,16 +11,16 @@ const walletSchema = z.object({
 });
 
 export async function GET(request: NextRequest) {
-  if (!requestHasValidSession(request)) return NextResponse.json({ error: "Não autorizado." }, { status: 401 });
-  return NextResponse.json({ wallets: listWallets() });
+  if (!(await requestHasValidSession(request))) return NextResponse.json({ error: "Não autorizado." }, { status: 401 });
+  return NextResponse.json({ wallets: await listWallets() });
 }
 
 export async function POST(request: NextRequest) {
-  if (!requestHasValidSession(request) || !validOrigin(request)) return NextResponse.json({ error: "Não autorizado." }, { status: 403 });
+  if (!(await requestHasValidSession(request)) || !validOrigin(request)) return NextResponse.json({ error: "Não autorizado." }, { status: 403 });
   const parsed = walletSchema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) return NextResponse.json({ error: "Confira o nome, o tipo e o saldo inicial da carteira." }, { status: 400 });
   const openingBalanceCents = parseNonNegativeMoney(parsed.data.openingBalance);
   if (openingBalanceCents === null) return NextResponse.json({ error: "Informe um saldo inicial válido de até R$ 1 bilhão." }, { status: 400 });
-  const id = createWallet({ ...parsed.data, openingBalanceCents });
+  const id = await createWallet({ ...parsed.data, openingBalanceCents });
   return NextResponse.json({ id }, { status: 201 });
 }
